@@ -3,10 +3,13 @@ using System.Security.Claims;
 using System.Text;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
+using Npgsql;
 using Prometheus;
 using Serilog;
 using Serilog.Formatting.Compact;
+using TaskManager.Api.Data;
 using TaskManager.Api.Models;
 using TaskManager.Api.Services;
 
@@ -24,15 +27,24 @@ try
     builder.Services.AddSwaggerGen();
     builder.Services.ConfigureHttpJsonOptions(options =>
         options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
-    builder.Services.AddHealthChecks();
-    builder.Services.AddSingleton<ITaskStore, InMemoryTaskStore>();
+
+    var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
+        ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection is required.");
+    builder.Services.AddDbContext<AppDbContext>(options => options.UseNpgsql(connectionString));
+    builder.Services.AddScoped<ITaskStore, PostgresTaskStore>();
+    builder.Services.AddSingleton(NpgsqlDataSource.Create(connectionString));
+    builder.Services.AddHealthChecks().AddCheck<PostgresHealthCheck>("postgresql", tags: ["ready"]);
 
     var jwtKey = builder.Configuration["Auth:JwtKey"] ?? "local-development-key-change-before-production-12345";
     builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer(options =>
         options.TokenValidationParameters = new TokenValidationParameters
         {
-            ValidateIssuer = true, ValidateAudience = true, ValidateLifetime = true, ValidateIssuerSigningKey = true,
-            ValidIssuer = "task-manager-api", ValidAudience = "task-manager-ui",
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = "task-manager-api",
+            ValidAudience = "task-manager-ui",
             IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey))
         });
     builder.Services.AddAuthorization();
@@ -41,14 +53,22 @@ try
         .AllowAnyHeader().AllowAnyMethod()));
 
     var app = builder.Build();
+
+    await using (var scope = app.Services.CreateAsyncScope())
+    {
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        await db.Database.MigrateAsync();
+        await SeedData.InitializeAsync(db);
+    }
+
     app.UseSerilogRequestLogging();
     app.UseCors();
     app.UseAuthentication();
     app.UseAuthorization();
     app.UseHttpMetrics();
     app.MapMetrics("/metrics");
-    app.MapHealthChecks("/health");
-    app.MapHealthChecks("/ready");
+    app.MapHealthChecks("/health", new() { Predicate = _ => false });
+    app.MapHealthChecks("/ready", new() { Predicate = check => check.Tags.Contains("ready") });
     app.UseSwagger();
     app.UseSwaggerUI();
 
@@ -76,43 +96,94 @@ try
     }).AllowAnonymous().WithTags("Authentication");
 
     var tasks = app.MapGroup("/api/tasks").RequireAuthorization().WithTags("Tasks");
-    tasks.MapGet("", (ITaskStore store) => Results.Ok(store.GetAll()));
-    tasks.MapGet("/{id:guid}", (Guid id, ITaskStore store) => store.Get(id) is { } task ? Results.Ok(task) : Results.NotFound());
-    tasks.MapPost("/", (CreateTaskRequest request, ITaskStore store, ClaimsPrincipal user, ILogger<Program> logger) =>
+
+    tasks.MapGet("", async (ITaskStore store, CancellationToken ct) => Results.Ok(await store.GetAllAsync(ct)));
+
+    tasks.MapGet("/{id:guid}", async (Guid id, ITaskStore store, CancellationToken ct) =>
+        await store.GetAsync(id, ct) is { } task ? Results.Ok(task) : Results.NotFound());
+
+    tasks.MapPost("/", async (CreateTaskRequest request, ITaskStore store, ClaimsPrincipal user,
+        ILogger<Program> logger, CancellationToken ct) =>
     {
         if (string.IsNullOrWhiteSpace(request.Title)) return Results.BadRequest(new { error = "Title is required." });
-        var task = new WorkTask { Title = request.Title.Trim(), Description = request.Description ?? "", Priority = request.Priority,
-            TimeEstimateHours = request.TimeEstimateHours, ClientName = request.ClientName ?? "", Assignee = request.Assignee ?? "",
-            DueDate = request.DueDate, Tags = request.Tags ?? [] };
-        store.Add(task); taskCreated.WithLabels(task.Priority.ToString()).Inc();
+        var task = new WorkTask
+        {
+            Title = request.Title.Trim(),
+            Description = request.Description ?? "",
+            Priority = request.Priority,
+            TimeEstimateHours = request.TimeEstimateHours,
+            ClientName = request.ClientName ?? "",
+            Assignee = request.Assignee ?? "",
+            DueDate = request.DueDate,
+            Tags = request.Tags ?? []
+        };
+        await store.AddAsync(task, ct);
+        taskCreated.WithLabels(task.Priority.ToString()).Inc();
         logger.LogInformation("Task {TaskId} created by {Username} with priority {Priority}", task.Id, user.Identity?.Name, task.Priority);
         return Results.Created($"/api/tasks/{task.Id}", task);
     });
-    tasks.MapPut("/{id:guid}", (Guid id, UpdateTaskRequest request, ITaskStore store, ILogger<Program> logger) =>
+
+    tasks.MapPut("/{id:guid}", async (Guid id, UpdateTaskRequest request, ITaskStore store,
+        ILogger<Program> logger, CancellationToken ct) =>
     {
-        var task = store.Get(id); if (task is null) return Results.NotFound();
+        var task = await store.GetAsync(id, ct);
+        if (task is null) return Results.NotFound();
+        if (string.IsNullOrWhiteSpace(request.Title)) return Results.BadRequest(new { error = "Title is required." });
         var oldStatus = task.Status;
-        task.Title = request.Title; task.Description = request.Description ?? ""; task.Status = request.Status; task.Priority = request.Priority;
-        task.TimeEstimateHours = request.TimeEstimateHours; task.ClientName = request.ClientName ?? ""; task.Assignee = request.Assignee ?? "";
-        task.DueDate = request.DueDate; task.Tags = request.Tags ?? []; task.UpdatedAt = DateTimeOffset.UtcNow;
+        task.Title = request.Title.Trim();
+        task.Description = request.Description ?? "";
+        task.Status = request.Status;
+        task.Priority = request.Priority;
+        task.TimeEstimateHours = request.TimeEstimateHours;
+        task.ClientName = request.ClientName ?? "";
+        task.Assignee = request.Assignee ?? "";
+        task.DueDate = request.DueDate;
+        task.Tags = request.Tags ?? [];
+        task.UpdatedAt = DateTimeOffset.UtcNow;
+        await store.SaveChangesAsync(ct);
         if (oldStatus != task.Status) taskMoved.WithLabels(oldStatus.ToString(), task.Status.ToString()).Inc();
-        logger.LogInformation("Task {TaskId} updated; status is {Status}", id, task.Status); return Results.Ok(task);
+        logger.LogInformation("Task {TaskId} updated; status is {Status}", id, task.Status);
+        return Results.Ok(task);
     });
-    tasks.MapPatch("/{id:guid}/status", (Guid id, ChangeStatusRequest request, ITaskStore store, ILogger<Program> logger) =>
+
+    tasks.MapPatch("/{id:guid}/status", async (Guid id, ChangeStatusRequest request, ITaskStore store,
+        ILogger<Program> logger, CancellationToken ct) =>
     {
-        var task = store.Get(id); if (task is null) return Results.NotFound();
-        var old = task.Status; task.Status = request.Status; task.UpdatedAt = DateTimeOffset.UtcNow;
+        var task = await store.GetAsync(id, ct);
+        if (task is null) return Results.NotFound();
+        var old = task.Status;
+        task.Status = request.Status;
+        task.UpdatedAt = DateTimeOffset.UtcNow;
+        await store.SaveChangesAsync(ct);
         taskMoved.WithLabels(old.ToString(), task.Status.ToString()).Inc();
-        logger.LogInformation("Task {TaskId} moved from {OldStatus} to {NewStatus}", id, old, task.Status); return Results.Ok(task);
+        logger.LogInformation("Task {TaskId} moved from {OldStatus} to {NewStatus}", id, old, task.Status);
+        return Results.Ok(task);
     });
-    tasks.MapPost("/{id:guid}/comments", (Guid id, AddCommentRequest request, ITaskStore store, ClaimsPrincipal user) =>
+
+    tasks.MapPost("/{id:guid}/comments", async (Guid id, AddCommentRequest request, ITaskStore store,
+        ClaimsPrincipal user, CancellationToken ct) =>
     {
-        var task = store.Get(id); if (task is null) return Results.NotFound();
+        var task = await store.GetAsync(id, ct);
+        if (task is null) return Results.NotFound();
         if (string.IsNullOrWhiteSpace(request.Body)) return Results.BadRequest(new { error = "Comment cannot be empty." });
-        task.Comments.Add(new TaskComment(Guid.NewGuid(), user.Identity?.Name ?? "unknown", request.Body.Trim(), DateTimeOffset.UtcNow));
-        task.UpdatedAt = DateTimeOffset.UtcNow; commentsAdded.Inc(); return Results.Ok(task);
+        task.Comments.Add(new TaskComment
+        {
+            WorkTaskId = task.Id,
+            Author = user.Identity?.Name ?? "unknown",
+            Body = request.Body.Trim()
+        });
+        task.UpdatedAt = DateTimeOffset.UtcNow;
+        await store.SaveChangesAsync(ct);
+        commentsAdded.Inc();
+        return Results.Ok(task);
     });
-    tasks.MapDelete("/{id:guid}", (Guid id, ITaskStore store) => { if (!store.Delete(id)) return Results.NotFound(); taskDeleted.Inc(); return Results.NoContent(); });
+
+    tasks.MapDelete("/{id:guid}", async (Guid id, ITaskStore store, CancellationToken ct) =>
+    {
+        if (!await store.DeleteAsync(id, ct)) return Results.NotFound();
+        taskDeleted.Inc();
+        return Results.NoContent();
+    });
 
     app.Run();
 }

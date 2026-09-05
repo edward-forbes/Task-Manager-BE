@@ -3,11 +3,18 @@ namespace TaskManager.Api.Models;
 public enum TaskState { New, InProgress, OnHold, PendingReview, Complete }
 public enum TaskPriority { Low, Medium, High, Critical }
 
-public sealed record TaskComment(Guid Id, string Author, string Body, DateTimeOffset CreatedAt);
+public sealed class TaskComment
+{
+    public Guid Id { get; set; } = Guid.NewGuid();
+    public Guid WorkTaskId { get; set; }
+    public string Author { get; set; } = "";
+    public string Body { get; set; } = "";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
 
 public sealed class WorkTask
 {
-    public Guid Id { get; init; } = Guid.NewGuid();
+    public Guid Id { get; set; } = Guid.NewGuid();
     public required string Title { get; set; }
     public string Description { get; set; } = "";
     public TaskState Status { get; set; } = TaskState.New;
@@ -17,8 +24,8 @@ public sealed class WorkTask
     public string Assignee { get; set; } = "";
     public DateOnly? DueDate { get; set; }
     public List<string> Tags { get; set; } = [];
-    public List<TaskComment> Comments { get; init; } = [];
-    public DateTimeOffset CreatedAt { get; init; } = DateTimeOffset.UtcNow;
+    public List<TaskComment> Comments { get; set; } = [];
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 

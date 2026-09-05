@@ -1,34 +1,40 @@
-using System.Collections.Concurrent;
+using Microsoft.EntityFrameworkCore;
+using TaskManager.Api.Data;
 using TaskManager.Api.Models;
 
 namespace TaskManager.Api.Services;
 
 public interface ITaskStore
 {
-    IReadOnlyCollection<WorkTask> GetAll();
-    WorkTask? Get(Guid id);
-    WorkTask Add(WorkTask task);
-    bool Delete(Guid id);
+    Task<IReadOnlyCollection<WorkTask>> GetAllAsync(CancellationToken cancellationToken);
+    Task<WorkTask?> GetAsync(Guid id, CancellationToken cancellationToken);
+    Task<WorkTask> AddAsync(WorkTask task, CancellationToken cancellationToken);
+    Task SaveChangesAsync(CancellationToken cancellationToken);
+    Task<bool> DeleteAsync(Guid id, CancellationToken cancellationToken);
 }
 
-public sealed class InMemoryTaskStore : ITaskStore
+public sealed class PostgresTaskStore(AppDbContext db) : ITaskStore
 {
-    private readonly ConcurrentDictionary<Guid, WorkTask> _tasks = new();
+    public async Task<IReadOnlyCollection<WorkTask>> GetAllAsync(CancellationToken cancellationToken) =>
+        await db.Tasks.AsNoTracking().Include(x => x.Comments)
+            .OrderBy(x => x.CreatedAt).ToArrayAsync(cancellationToken);
 
-    public InMemoryTaskStore()
+    public Task<WorkTask?> GetAsync(Guid id, CancellationToken cancellationToken) =>
+        db.Tasks.Include(x => x.Comments).SingleOrDefaultAsync(x => x.Id == id, cancellationToken);
+
+    public async Task<WorkTask> AddAsync(WorkTask task, CancellationToken cancellationToken)
     {
-        foreach (var task in SeedData()) _tasks[task.Id] = task;
+        db.Tasks.Add(task);
+        await db.SaveChangesAsync(cancellationToken);
+        return task;
     }
 
-    public IReadOnlyCollection<WorkTask> GetAll() => _tasks.Values.OrderBy(x => x.CreatedAt).ToArray();
-    public WorkTask? Get(Guid id) => _tasks.GetValueOrDefault(id);
-    public WorkTask Add(WorkTask task) { _tasks[task.Id] = task; return task; }
-    public bool Delete(Guid id) => _tasks.TryRemove(id, out _);
+    public async Task SaveChangesAsync(CancellationToken cancellationToken) =>
+        await db.SaveChangesAsync(cancellationToken);
 
-    private static IEnumerable<WorkTask> SeedData()
+    public async Task<bool> DeleteAsync(Guid id, CancellationToken cancellationToken)
     {
-        yield return new WorkTask { Title = "Connect the real PostgreSQL store", Description = "Replace the in-memory repository in the next milestone.", Priority = TaskPriority.High, ClientName = "Internal", Tags = ["database", "gitops"] };
-        yield return new WorkTask { Title = "Create Grafana dashboard", Description = "Visualize API request rate, task operations and latency.", Status = TaskState.InProgress, Priority = TaskPriority.Medium, TimeEstimateHours = 3, Tags = ["observability"] };
-        yield return new WorkTask { Title = "Review Kubernetes probes", Status = TaskState.PendingReview, Priority = TaskPriority.Low, TimeEstimateHours = 1, Tags = ["kubernetes"] };
+        var deleted = await db.Tasks.Where(x => x.Id == id).ExecuteDeleteAsync(cancellationToken);
+        return deleted > 0;
     }
 }
